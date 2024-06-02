@@ -10,14 +10,16 @@ import time
 import traceback
 
 APP_NAME = 'SSHFS-Mounter'
-APP_VERSION = '0.1'
+APP_VERSION = '0.2'
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(os.path.realpath(sys.executable))
     RES_DIR = os.path.realpath(os.path.join(APP_DIR, '..', 'Resources'))
+    BIN_DIR = APP_DIR
 else:
     APP_DIR = os.path.dirname(os.path.realpath(__file__))
     RES_DIR = os.path.join(APP_DIR, 'resources')
+    BIN_DIR = os.path.join(APP_DIR, 'bin')
 
 
 # Simple XOR encryption of passwords stored in JSON file
@@ -28,16 +30,24 @@ CYBERDUCK_BM_DIR = os.path.join(os.environ['HOME'], 'Library', 'Group Containers
 FILEZILLA_XML_FILE = os.path.join(os.environ['HOME'], '.config', 'filezilla', 'sitemanager.xml')
 
 MAX_WAIT_CONNECT_SEC = 5
+POLL_PERIOD_SEC = .5
 
 
 class MyApp(rumps.App):
 
-    def __init__(self, *args, **kwargs):
-
-        super().__init__(*args,
+    ########################################
+    #
+    ########################################
+    def __init__(self):
+        super().__init__(
+                APP_NAME,
                 icon=os.path.join(RES_DIR, "app.icns"),
                 quit_button=None
                 )
+
+        self._debug = False
+        self._poll_data = {}
+        self._poll_timer = rumps.Timer(self.check_mount, POLL_PERIOD_SEC)
 
         tmp_dir = f'/tmp/sshfs'
         if not os.path.isdir(tmp_dir):
@@ -78,11 +88,21 @@ class MyApp(rumps.App):
             config_menu.append(rumps.MenuItem('Import from Cyberduck', callback=self.import_connections_cyberduck))
         if has_filezilla:
             config_menu.append(rumps.MenuItem('Import from FileZilla', callback=self.import_connections_filezilla))
+        config_menu.append(None)
+        config_menu.append(rumps.MenuItem('Debug', callback=self.toggle_debug))
+
         menu.append({'Settings': config_menu})
         menu.append(None)
         menu.append(rumps.MenuItem('Quit', callback=rumps.quit_application))
 
         self.menu.update(menu)
+
+    ########################################
+    #
+    ########################################
+    def toggle_debug(self, sender):
+        sender.state = not sender.state
+        self._debug = sender.state
 
     ########################################
     #
@@ -106,28 +126,29 @@ class MyApp(rumps.App):
 
             elif os.path.ismount(mount_point):
                 # volume already mounted, ignore silently
-                sender.state = not sender.state
+                sender.state = 1
                 subprocess.call(["open", mount_point])
                 return
 
             env = {}
 
             command = [
-                    os.path.join(APP_DIR, 'sshfs'),
+                    os.path.join(BIN_DIR, 'sshfs'),
                     f"{con['user']}@{con['host']}:{con['path']}",
-                    mount_point,  #"/tmp/sshfs",
+                    mount_point,
                     f"-p{con['port']}",
-                    #"-odebug", "-ologlevel=debug1",
                     f'-ovolname={volname}',
                     "-oStrictHostKeyChecking=no", "-oUserKnownHostsFile=/dev/null",
                     ]
 
+            if self._debug:
+                command += ['-odebug', '-ologlevel=debug1']
+
             if con["auth"] == "key":
                 if not os.path.isfile(os.path.expanduser(con['key_file'])):
-                    # 'Key doesn\'t exist'
                     rumps.Window(message='The assigned private key file does not exist:\n\n{}'.format(con['key_file']), dimensions=(320, 0)).run()
                     return
-                command += ["-oPreferredAuthentications=publickey", "-oIdentityFile='{}'".format(con['key_file'])]
+                command += ["-oPreferredAuthentications=publickey", "-oIdentityFile={}".format(con['key_file'])]
 
             else:
                 if con["auth"] == "password":
@@ -150,24 +171,41 @@ class MyApp(rumps.App):
 
                 env["SSHPASS"] = pw
 
-                command += [f"-ossh_command={os.path.join(APP_DIR, 'sshpass')} -e ssh"]
+                command += [f"-ossh_command={os.path.join(BIN_DIR, 'sshpass')} -eSSHPASS ssh"]
+
+            if self._debug:
+                print(' '.join(command))
 
             proc = subprocess.Popen(command, env=env)
 
-            for i in range(int(MAX_WAIT_CONNECT_SEC / .2)):
-                time.sleep(.2)
-                res = proc.poll()
-                if res is not None:
-                    break
+            self._poll_data[con['name']] = {'mount_point': mount_point, 'menu_item': sender, 'counter': int(MAX_WAIT_CONNECT_SEC / POLL_PERIOD_SEC)}
+            if not self._poll_timer.is_alive():
+                self._poll_timer.start()
 
-            if res == 0:
-                subprocess.call(["open", mount_point])
-                sender.state = not sender.state
-            else:
-                rumps.Window(message='Failed to connect to {}'.format(con['name']), dimensions=(320, 0)).run()
         else:
             subprocess.Popen(["/usr/sbin/diskutil", "umount", "force", mount_point])
-            sender.state = not sender.state
+            sender.state = 0
+
+    ########################################
+    #
+    ########################################
+    def check_mount(self, timer):
+        for con_name in list(self._poll_data.keys()):
+            data = self._poll_data[con_name]
+            data['counter'] -= 1
+            if os.path.ismount(data['mount_point']):
+                data['menu_item'].state = 1
+                subprocess.call(["open", data['mount_point']])
+                del self._poll_data[con_name]
+            else:
+                data['counter'] -= 1
+                if data['counter'] <= 0:
+                    print(f"Failed to connect to {con_name}")
+                    rumps.notification("Connection failed", "", f"Failed to connect to {con_name}", sound=False)
+                    del self._poll_data[con_name]
+
+        if not self._poll_data:
+            self._poll_timer.stop()
 
     ########################################
     #
@@ -342,4 +380,4 @@ class MyApp(rumps.App):
 
 if __name__ == "__main__":
     sys.excepthook = traceback.print_exception
-    MyApp(APP_NAME).run()
+    MyApp().run()
